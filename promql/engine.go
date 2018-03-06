@@ -359,13 +359,15 @@ func (ng *Engine) execEvalStmt(ctx context.Context, query *query, s *EvalStmt) (
 	}
 
 	evalTimer := query.stats.GetTimer(stats.InnerEvalTime).Start()
-	// Instant evaluation.
+	// Instant evaluation. This is executed as a range evaulation with one step.
 	if s.Start == s.End && s.Interval == 0 {
 		start := timeMilliseconds(s.Start)
 		evaluator := &evaluator{
-			Timestamp: start,
-			ctx:       ctx,
-			logger:    ng.logger,
+			Timestamp:    start,
+			EndTimestamp: start,
+			Interval:     1,
+			ctx:          ctx,
+			logger:       ng.logger,
 		}
 		val, err := evaluator.Eval(s.Expr)
 		if err != nil {
@@ -374,18 +376,29 @@ func (ng *Engine) execEvalStmt(ctx context.Context, query *query, s *EvalStmt) (
 
 		evalTimer.Stop()
 		ng.metrics.queryInnerEval.Observe(evalTimer.ElapsedTime().Seconds())
-		// Point might have a different timestamp, force it to the evaluation
-		// timestamp as that is when we ran the evaluation.
-		switch v := val.(type) {
-		case Scalar:
-			v.T = start
-		case Vector:
-			for i := range v {
-				v[i].Point.T = start
+
+		mat, ok := val.(Matrix)
+		if !ok {
+			panic(fmt.Errorf("promql.Engine.exec: invalid expression type %q", val.Type()))
+		}
+		switch s.Expr.Type() {
+		case ValueTypeVector:
+			// Convert matrix with one value per series into vector.
+			vector := make(Vector, len(mat))
+			for i, s := range mat {
+				// Point might have a different timestamp, force it to the evaluation
+				// timestamp as that is when we ran the evaluation.
+				vector[i] = Sample{Metric: s.Metric, Point: Point{V: s.Points[0].V, T: start}}
 			}
+			return vector, nil
+		case ValueTypeScalar:
+			return Scalar{V: mat[0].Points[0].V, T: start}, nil
+		case ValueTypeMatrix:
+			return mat, nil
+		default:
+			panic(fmt.Errorf("promql.Engine.exec: unexpected expression type %q", s.Expr.Type()))
 		}
 
-		return val, nil
 	}
 	// Range evaluation.
 	if err := contextDone(ctx, "range evaluation"); err != nil {
@@ -408,7 +421,7 @@ func (ng *Engine) execEvalStmt(ctx context.Context, query *query, s *EvalStmt) (
 
 	mat, ok := val.(Matrix)
 	if !ok {
-		panic(fmt.Errorf("promql.Engine.exec: invalid expression type %q", mat.Type()))
+		panic(fmt.Errorf("promql.Engine.exec: invalid expression type %q", val.Type()))
 	}
 
 	if err := contextDone(ctx, "expression evaluation"); err != nil {
@@ -584,7 +597,11 @@ func (ev *evaluator) evalScalar(e Expr) Scalar {
 	val := ev.eval(e)
 	sv, ok := val.(Scalar)
 	if !ok {
-		ev.errorf("expected Scalar but got %s", documentedType(val.Type()))
+		mat, ok := val.(Matrix)
+		if !ok {
+			ev.errorf("expected Scalar but got %s", documentedType(val.Type()))
+		}
+		return Scalar{V: mat[0].Points[0].V, T: mat[0].Points[0].T}
 	}
 	return sv
 }
@@ -594,7 +611,16 @@ func (ev *evaluator) evalVector(e Expr) Vector {
 	val := ev.eval(e)
 	vec, ok := val.(Vector)
 	if !ok {
-		ev.errorf("expected instant Vector but got %s", documentedType(val.Type()))
+		mat, ok := val.(Matrix)
+		if !ok {
+			ev.errorf("expected instant Vector but got %s", documentedType(val.Type()))
+		}
+		// Convert matrix with one value per series into vector.
+		vector := make(Vector, len(mat))
+		for i, s := range mat {
+			vector[i] = Sample{Metric: s.Metric, Point: s.Points[0]}
+		}
+		return vector
 	}
 	return vec
 }
@@ -659,10 +685,99 @@ func (ev *evaluator) eval(expr Expr) Value {
 		ev.error(err)
 	}
 
-	// Range evaluation.
-	_, isAggr := expr.(*AggregateExpr)
-	call, isCall := expr.(*Call)
-	if ev.EndTimestamp != 0 && !isAggr && !(isCall && call.Func.FastCall != nil) {
+	rangeWrapper := func(f func([]Value) Vector, exprs ...Expr) Value {
+		if ev.Interval != 0 {
+			numSteps := (ev.EndTimestamp - ev.Timestamp) / ev.Interval
+			matrixes := make([]Matrix, len(exprs))
+			for i, e := range exprs {
+				// Functions will take string arguments from the expressions, not the values.
+				if e.Type() != ValueTypeString {
+					matrixes[i] = ev.evalMatrix(e)
+				}
+			}
+			Seriess := map[uint64]Series{}
+			args := make([]Value, len(exprs))
+			for ts := ev.Timestamp; ts <= ev.EndTimestamp; ts += ev.Interval {
+				// Gather input vectors for this timestamp.
+				vectors := make([]Vector, len(exprs))
+				for i := range exprs {
+					vectors[i] = make(Vector, 0, len(matrixes[i]))
+					for _, series := range matrixes[i] {
+						for _, point := range series.Points {
+							if point.T == ts {
+								vectors[i] = append(vectors[i], Sample{Metric: series.Metric, Point: point})
+							}
+							if point.T >= ts {
+								//TODO optimise here, move slice forward so we don't
+								// re-check samples we're already past
+								break
+							}
+						}
+					}
+				}
+				for i := range vectors {
+					args[i] = vectors[i]
+				}
+				result := f(args)
+				// If this could be an instant query, shortcut so as not to change sort order.
+				if ev.EndTimestamp == ev.Timestamp {
+					mat := make(Matrix, len(result))
+					for i, s := range result {
+						mat[i] = Series{Metric: s.Metric, Points: []Point{s.Point}}
+					}
+					return mat
+				}
+				// Add output vectors to output series.
+				for _, sample := range result {
+					h := sample.Metric.Hash()
+					ss, ok := Seriess[h]
+					if !ok {
+						ss = Series{
+							Metric: sample.Metric,
+							Points: make([]Point, 0, numSteps),
+						}
+						Seriess[h] = ss
+					}
+					sample.Point.T = ts
+					ss.Points = append(ss.Points, sample.Point)
+					Seriess[h] = ss
+				}
+			}
+			mat := Matrix{}
+			for _, ss := range Seriess {
+				mat = append(mat, ss)
+			}
+			return mat
+		} else {
+			vectors := make([]Value, len(exprs))
+			for i, e := range exprs {
+				vectors[i] = ev.evalVector(e)
+			}
+			resultVector := f(vectors)
+			mat := make(Matrix, len(resultVector))
+			for i, s := range resultVector {
+				mat[i] = Series{Metric: s.Metric, Points: []Point{s.Point}}
+			}
+			return mat
+		}
+	}
+
+	switch e := expr.(type) {
+	case *AggregateExpr:
+		return rangeWrapper(func(v []Value) Vector {
+			return ev.aggregation(e.Op, e.Grouping, e.Without, e.Param, v[0].(Vector))
+		}, e.Expr)
+
+	case *Call:
+		if e.Func.FastCall != nil {
+			return rangeWrapper(func(v []Value) Vector {
+				return e.Func.FastCall(v, e.Args)
+			}, e.Args...)
+		}
+	}
+
+	// Convert range evaluation into multiple instant evaluations.
+	if ev.Interval != 0 {
 		numSteps := (ev.EndTimestamp - ev.Timestamp) / ev.Interval
 		Seriess := map[uint64]Series{}
 		for ts := ev.Timestamp; ts <= ev.EndTimestamp; ts += ev.Interval {
@@ -693,6 +808,14 @@ func (ev *evaluator) eval(expr Expr) Value {
 				ss.Points = append(ss.Points, Point{V: v.V, T: ts})
 				Seriess[0] = ss
 			case Vector:
+				// If this could be an instant query, shortcut so as not to change sort order.
+				if ev.EndTimestamp == ev.Timestamp {
+					mat := make(Matrix, len(v))
+					for i, s := range v {
+            mat[i] = Series{Metric: s.Metric, Points: []Point{Point{V: s.Point.V, T: ts}}}
+					}
+					return mat
+				}
 				for _, sample := range v {
 					h := sample.Metric.Hash()
 					ss, ok := Seriess[h]
@@ -707,6 +830,8 @@ func (ev *evaluator) eval(expr Expr) Value {
 					ss.Points = append(ss.Points, sample.Point)
 					Seriess[h] = ss
 				}
+			case Matrix:
+				return val
 			default:
 				panic(fmt.Errorf("promql.Engine.exec: invalid expression type %q", val.Type()))
 			}
@@ -721,73 +846,7 @@ func (ev *evaluator) eval(expr Expr) Value {
 		return mat
 	}
 
-	rangeWrapper := func(f func([]Value) Vector, exprs ...Expr) Value {
-		if ev.EndTimestamp != 0 {
-			numSteps := (ev.EndTimestamp - ev.Timestamp) / ev.Interval
-			matrixes := make([]Matrix, len(exprs))
-			for i, e := range exprs {
-				matrixes[i] = ev.evalMatrix(e)
-			}
-			Seriess := map[uint64]Series{}
-			args := make([]Value, len(exprs))
-			for ts := ev.Timestamp; ts <= ev.EndTimestamp; ts += ev.Interval {
-				// Gather input vectors for this timestamp.
-				vectors := make([]Vector, len(exprs))
-				for i := range exprs {
-					vectors[i] = make(Vector, 0, len(matrixes[i]))
-					for _, series := range matrixes[i] {
-						for _, point := range series.Points {
-							if point.T == ts {
-								vectors[i] = append(vectors[i], Sample{Metric: series.Metric, Point: point})
-							}
-							if point.T >= ts {
-								//TODO optimise here, move slice forward so we don't
-								// re-check samples we're already past
-								break
-							}
-						}
-					}
-				}
-				for i := range vectors {
-					args[i] = vectors[i]
-				}
-				result := f(args)
-				// Add output vectors to output series.
-				for _, sample := range result {
-					h := sample.Metric.Hash()
-					ss, ok := Seriess[h]
-					if !ok {
-						ss = Series{
-							Metric: sample.Metric,
-							Points: make([]Point, 0, numSteps),
-						}
-						Seriess[h] = ss
-					}
-					sample.Point.T = ts
-					ss.Points = append(ss.Points, sample.Point)
-					Seriess[h] = ss
-				}
-			}
-			mat := Matrix{}
-			for _, ss := range Seriess {
-				mat = append(mat, ss)
-			}
-			return mat
-		} else {
-			vectors := make([]Value, len(exprs))
-			for i, e := range exprs {
-				vectors[i] = ev.evalVector(e)
-			}
-			return f(vectors)
-		}
-	}
-
 	switch e := expr.(type) {
-	case *AggregateExpr:
-		return rangeWrapper(func(v []Value) Vector {
-			return ev.aggregation(e.Op, e.Grouping, e.Without, e.Param, v[0].(Vector))
-		}, e.Expr)
-
 	case *BinaryExpr:
 		switch lt, rt := e.LHS.Type(), e.RHS.Type(); {
 		case lt == ValueTypeScalar && rt == ValueTypeScalar:
@@ -815,13 +874,7 @@ func (ev *evaluator) eval(expr Expr) Value {
 		}
 
 	case *Call:
-		if e.Func.FastCall != nil {
-			return rangeWrapper(func(v []Value) Vector {
-				return e.Func.FastCall(v)
-			}, e.Args...)
-		} else {
-			return e.Func.Call(ev, e.Args)
-		}
+		return e.Func.Call(ev, e.Args)
 
 	case *MatrixSelector:
 		return ev.matrixSelector(e)
@@ -1360,7 +1413,7 @@ func (ev *evaluator) aggregation(op ItemType, grouping []string, without bool, p
 	}
 	var valueLabel string
 	if op == itemCountValues {
-		valueLabel = ev.evalString(param).V
+		valueLabel = param.(*StringLiteral).Val
 		if !without {
 			grouping = append(grouping, valueLabel)
 		}
