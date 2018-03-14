@@ -30,18 +30,32 @@ func BenchmarkRangeQuery(b *testing.B) {
 	defer storage.Close()
 	engine := NewEngine(nil, nil, 10, 100*time.Second)
 
-	metrics := make([]labels.Labels, 0, 10000)
-	refs := make([]uint64, 10000)
+	metrics := []labels.Labels{}
 	metrics = append(metrics, labels.FromStrings("__name__", "a_one"))
 	metrics = append(metrics, labels.FromStrings("__name__", "b_one"))
+	for j := 0; j < 10; j++ {
+		metrics = append(metrics, labels.FromStrings("__name__", "h_one", "le", strconv.Itoa(j)))
+	}
+	metrics = append(metrics, labels.FromStrings("__name__", "h_one", "le", "+Inf"))
+
 	for i := 0; i < 10; i++ {
 		metrics = append(metrics, labels.FromStrings("__name__", "a_ten", "l", strconv.Itoa(i)))
 		metrics = append(metrics, labels.FromStrings("__name__", "b_ten", "l", strconv.Itoa(i)))
+		for j := 0; j < 10; j++ {
+			metrics = append(metrics, labels.FromStrings("__name__", "h_ten", "l", strconv.Itoa(i), "le", strconv.Itoa(j)))
+		}
+		metrics = append(metrics, labels.FromStrings("__name__", "h_ten", "l", strconv.Itoa(i), "le", "+Inf"))
 	}
+
 	for i := 0; i < 100; i++ {
 		metrics = append(metrics, labels.FromStrings("__name__", "a_hundred", "l", strconv.Itoa(i)))
 		metrics = append(metrics, labels.FromStrings("__name__", "b_hundred", "l", strconv.Itoa(i)))
+		for j := 0; j < 10; j++ {
+			metrics = append(metrics, labels.FromStrings("__name__", "h_hundred", "l", strconv.Itoa(i), "le", strconv.Itoa(j)))
+		}
+		metrics = append(metrics, labels.FromStrings("__name__", "h_hundred", "l", strconv.Itoa(i), "le", "+Inf"))
 	}
+	refs := make([]uint64, len(metrics))
 
 	// A day of data plus 10k steps.
 	numIntervals := 8640 + 10000
@@ -102,6 +116,15 @@ func BenchmarkRangeQuery(b *testing.B) {
 		// Combinations.
 		{
 			expr: "rate(a_X[1m]) + rate(b_X[1m])",
+		},
+		{
+			expr: "sum without (l)(rate(a_X[1m]))",
+		},
+		{
+			expr: "sum without (l)(rate(a_X[1m])) / sum without (l)(rate(b_X[1m]))",
+		},
+		{
+			expr: "histogram_quantile(0.9, rate(h_X[5m]))",
 		},
 	}
 
